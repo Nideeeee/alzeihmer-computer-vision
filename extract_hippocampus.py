@@ -1,10 +1,11 @@
 import nibabel as nib
 import numpy as np
 import os
+import pandas as pd
 
 # --- 1. Dossiers et chemins ---
-data_dir = "/home/mfrancois008/ENSEIRB/ENSEIRB_3A/vision_ordinateur/projet/adni1-samples"   # à adapter
-atlas_path = "/home/mfrancois008/fsl/data/atlases/HarvardOxford/HarvardOxford-sub-maxprob-thr25-1mm.nii.gz"
+data_dir = "/home/llatarche002/ComputerVision/alzeihmer-computer-vision/adni"   # à adapter
+atlas_path = "/home/llatarche002/ComputerVision/alzeihmer-computer-vision/HarvardOxford-sub-maxprob-thr25-1mm.nii.gz"
 output_dir = os.path.join(data_dir, "../hippocampi_cubes")
 os.makedirs(output_dir, exist_ok=True)
 
@@ -32,21 +33,40 @@ z_max = min(mask_hipp.shape[2]-1, z_max + margin)
 
 print(f"Bounding box MNI hippocampes : X[{x_min}:{x_max}], Y[{y_min}:{y_max}], Z[{z_min}:{z_max}]")
 
-# --- 3. Itération sur toutes les IRM ---
-for fname in os.listdir(data_dir):
-    if not fname.endswith(".nii.gz"):
-        continue
-    if fname.startswith("mask_"):
-        continue  # on ignore les masques ici, on les chargera selon l'image correspondante
+# --- Paramètres ---
+data_dir = "adni"
+output_dir = "hippocampi_cubes"
+os.makedirs(output_dir, exist_ok=True)
 
+# --- Chargement du CSV ---
+csv_path = "adni/list_standardized_tongtong_2017.csv"
+df = pd.read_csv(csv_path)
+
+# --- Initialisation des listes ---
+x_train = []
+y_train = []
+x_test = []
+y_test = []
+
+# --- Itération sur le CSV ---
+for idx, row in df.iterrows():
+    nom = row[0]        # première colonne : nom du fichier
+    label_raw = row[4]  # cinquième colonne : label
+    mci_code = row[5]   # sixième colonne : code pour MCI
+
+    # Construire le chemin du fichier
+    fname = f"n_mmni_fADNI_{nom}_1.5T_t1w.nii.gz"
     img_path = os.path.join(data_dir, fname)
     mask_path = os.path.join(data_dir, f"mask_{fname}")
 
+    if not os.path.exists(img_path):
+        print(f"⚠️ Fichier IRM non trouvé : {img_path}, on saute.")
+        continue
     if not os.path.exists(mask_path):
-        print(f"⚠️ Pas de masque trouvé pour {fname}, on saute.")
+        print(f"⚠️ Masque non trouvé : {mask_path}, on saute.")
         continue
 
-    print(f"\nTraitement de {fname}...")
+    #print(f"\nTraitement de {fname}...")
 
     # --- Charger IRM et masque ---
     img = nib.load(img_path)
@@ -64,10 +84,42 @@ for fname in os.listdir(data_dir):
     new_affine = img.affine.copy()
     new_affine[:3, 3] += np.dot(img.affine[:3, :3], np.array([x_min, y_min, z_min]))
 
-    # --- Sauvegarder ---
-    output_path = os.path.join(output_dir, f"hippocampi_cube_{fname}")
-    cube_img = nib.Nifti1Image(cube, new_affine, img.header)
-    nib.save(cube_img, output_path)
+    # --- Ajouter aux datasets ---
+    if label_raw == "AD":
+        x_train.append(cube)
+        y_train.append(1)
+    elif label_raw == "CN":
+        x_train.append(cube)
+        y_train.append(0)
+    elif label_raw == "MCI":
+        if mci_code in [1, 2, 3]:
+            x_test.append(cube)
+            y_test.append(1)
+        elif mci_code == 4:
+            x_test.append(cube)
+            y_test.append(0)
+        elif mci_code == 5:
+            print(f"Code 5 pour MCI, cube ignoré : {fname}")
+            continue
+        else:
+            #print(f"⚠️ Code MCI inconnu : {mci_code}, cube ignoré.")
+            continue
+    else:
+        #print(f"⚠️ Label inconnu pour {fname} : {label_raw}, on ignore.")
+        continue
 
-    print(f"Cube sauvegardé : {output_path}")
-    print(f"   Taille : {cube.shape}")
+# --- Conversion en arrays numpy ---
+x_train = np.array(x_train)
+y_train = np.array(y_train)
+x_test = np.array(x_test)
+y_test = np.array(y_test)
+
+# --- Sauvegarder array ---
+np.save(os.path.join("datas", "x_train_hippocampi.npy"), x_train)
+np.save(os.path.join("datas", "y_train_hippocampi.npy"), y_train)
+np.save(os.path.join("datas", "x_test_hippocampi.npy"), x_test)
+np.save(os.path.join("datas", "y_test_hippocampi.npy"), y_test)
+
+print(f"\n--- Résumé ---")
+print(f"x_train : {x_train.shape}, y_train : {y_train.shape}")
+print(f"x_test : {x_test.shape}")

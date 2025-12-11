@@ -11,7 +11,7 @@ from collections import Counter
 from tqdm import tqdm
 
 # ==========================================
-# 1. DÉFINITIONS (Doit matcher l'entraînement)
+# 1. DÉFINITIONS
 # ==========================================
 
 class ADNI2p5DSingleSubjectDataset(Dataset):
@@ -24,167 +24,138 @@ class ADNI2p5DSingleSubjectDataset(Dataset):
     def __getitem__(self, idx):
         return torch.load(self.files[idx])
 
-# Modèle identique à l'entraînement, mais qui renvoie (logits, features)
 class ResNetForInference(nn.Module):
     def __init__(self, num_classes=2):
         super(ResNetForInference, self).__init__()
-        # On initialise l'architecture ResNet18 standard
         base_model = models.resnet18(weights=None) 
         self.features = nn.Sequential(*list(base_model.children())[:-1])
         self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        # Normalisation si nécessaire (comme à l'entraînement)
         if x.max() > 10.0: x = x / 255.0
-        
         x = self.features(x)
         x = x.view(x.size(0), -1) 
-        
-        features = x      # On capture les embeddings (taille 512)
-        logits = self.fc(x) # On calcule la prédiction
-        
-        # On renvoie les DEUX
+        features = x      
+        logits = self.fc(x) 
         return logits, features
+
+def extract_embeddings(loader, model, device):
+    embeddings, preds, labels = [], [], []
+    with torch.no_grad():
+        for slices, label in tqdm(loader, desc="Extraction"):
+            slices = slices[0].to(device)
+            label = label.item()
+            
+            logits, features = model(slices)
+            
+            # Agrégation Patient (Moyenne)
+            patient_feat = features.mean(dim=0).cpu().numpy()
+            slice_preds = logits.argmax(dim=1).cpu().numpy()
+            patient_pred = Counter(slice_preds).most_common(1)[0][0]
+            
+            embeddings.append(patient_feat)
+            preds.append(patient_pred)
+            labels.append(label)
+    return np.array(embeddings), np.array(preds), np.array(labels)
 
 # ==========================================
 # 2. CONFIGURATION
 # ==========================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- CONFIGURATION DES CHEMINS ---
-test_dir = "slices_cache_filtered/mci/test" 
-model_path = "weights/best_model_loss.pth" # Ton meilleur modèle
+# Chemins
+mci_test_dir = "slices_cache_filtered/mci/test" 
+cn_ad_test_dir = "slices_cache_filtered/mci/train" # Nouveau dossier pour CN/AD
+
+model_path = "weights/best_model_loss.pth" 
 
 if not os.path.exists(model_path):
-    print(f"⚠ '{model_path}' introuvable, essai avec 'best_model_temp.pth'...")
-    model_path = "weights/best_model_temp.pth"
-# Vérifications
-if not os.path.exists(test_dir):
-    raise FileNotFoundError(f"❌ Dossier de test introuvable : {test_dir}")
-if not os.path.exists(model_path):
-    print(f"⚠ Attention : '{model_path}' introuvable.")
-    model_path = "best_model_slice_training.pth" # Fallback sur l'ancien modèle si besoin
-    print(f"-> Essai avec '{model_path}'...")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError("❌ Aucun modèle trouvé !")
+    print(f"⚠ '{model_path}' introuvable, essai avec 'best_model.pth'...")
+    model_path = "best_model.pth"
 
-print(f"Chargement des données depuis {test_dir}...")
-test_dataset = ADNI2p5DSingleSubjectDataset(test_dir)
-test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
-
+# Chargement Modèle
 print(f"Chargement du modèle depuis {model_path}...")
 model = ResNetForInference(num_classes=2).to(device)
-
-# Chargement des poids (ignore les différences mineures si strict=False, mais ici ça devrait matcher)
 try:
     model.load_state_dict(torch.load(model_path, map_location=device))
-except RuntimeError as e:
-    print("⚠ Erreur de chargement stricte, tentative avec strict=False...")
+except:
     model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
-
 model.eval()
 
 # ==========================================
-# 3. EXTRACTION
+# 3. ANALYSE 1 : MCI (STABLE vs CONVERTER)
 # ==========================================
-print("Extraction des embeddings et prédictions en cours...")
+print("\n--- ANALYSE MCI (Test Set) ---")
+mci_dataset = ADNI2p5DSingleSubjectDataset(mci_test_dir)
+mci_loader = DataLoader(mci_dataset, batch_size=1, shuffle=False, num_workers=4)
 
-patient_embeddings = []
-patient_preds = []
-patient_labels = []
+X_mci, y_pred_mci, y_true_mci = extract_embeddings(mci_loader, model, device)
 
-with torch.no_grad():
-    for slices, label in tqdm(test_loader):
-        slices = slices[0].to(device)
-        label = label.item()
-        
-        # Récupération Logits ET Features
-        logits, features = model(slices)
-        
-        # 1. Moyenne des features (Aggregation Patient pour t-SNE)
-        patient_feat = features.mean(dim=0).cpu().numpy()
-        
-        # 2. Vote majoritaire (Agrégation Patient pour Prédiction)
-        slice_preds = logits.argmax(dim=1).cpu().numpy()
-        patient_pred = Counter(slice_preds).most_common(1)[0][0]
-        
-        patient_embeddings.append(patient_feat)
-        patient_preds.append(patient_pred)
-        patient_labels.append(label)
+# t-SNE MCI
+tsne = TSNE(n_components=2, perplexity=min(30, len(X_mci)-1), random_state=42)
+X_emb_mci = tsne.fit_transform(X_mci)
 
-# Conversion en numpy arrays
-X = np.array(patient_embeddings)
-y_pred = np.array(patient_preds)
-y_true = np.array(patient_labels)
+# PLOT MCI
+fig, axes = plt.subplots(1, 2, figsize=(18, 8))
 
-# ==========================================
-# 4. STATISTIQUES COMPARATIVES
-# ==========================================
-print("\n" + "="*40)
-print("   BILAN PRÉDICTIONS vs RÉALITÉ")
-print("="*40)
+# Couleurs personnalisées (Hex codes pour être bien visibles)
+# 0 = Bleu (Stable), 1 = Rouge (Converter)
+colors = ['#1f77b4', '#d62728'] 
+labels_map = ['Stable (0)', 'Converter (1)']
 
-# Comptage
-count_pred_0 = (y_pred == 0).sum() # Stable prédits
-count_pred_1 = (y_pred == 1).sum() # Converter prédits
+# Graphe 1 : Prédictions
+for i in [0, 1]:
+    idx = y_pred_mci == i
+    axes[0].scatter(X_emb_mci[idx, 0], X_emb_mci[idx, 1], c=colors[i], label=labels_map[i], s=80, alpha=0.8, edgecolors='white')
+axes[0].set_title("PRÉDICTIONS (MCI)")
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
 
-count_true_0 = (y_true == 0).sum() # Stable réels
-count_true_1 = (y_true == 1).sum() # Converter réels
+# Graphe 2 : Vrais Labels
+for i in [0, 1]:
+    idx = y_true_mci == i
+    axes[1].scatter(X_emb_mci[idx, 0], X_emb_mci[idx, 1], c=colors[i], label=labels_map[i], s=80, alpha=0.8, edgecolors='white')
+axes[1].set_title("VRAIS LABELS (MCI)")
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
 
-print(f"\n1. VOLUMES GLOBAUX :")
-print(f"{'Classe':<15} | {'Prédits (Modèle)':<18} | {'Réels (Labels)':<15}")
-print("-" * 55)
-print(f"{'Stable (0)':<15} | {count_pred_0:<18} | {count_true_0:<15}")
-print(f"{'Converter (1)':<15} | {count_pred_1:<18} | {count_true_1:<15}")
-
-# Matrice de confusion
-try:
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-except ValueError:
-    # Cas rare où une classe serait absente
-    cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm[0,0], cm[0,1], cm[1,0], cm[1,1]
-
-print(f"\n2. DÉTAILS (Matrice de Confusion) :")
-print(f" - Vrais Stables (TN)      : {tn}")
-print(f" - Vrais Converters (TP)   : {tp}")
-print(f" - Faux Positifs (FP)      : {fp} (Stable prédit Converter)")
-print(f" - Faux Négatifs (FN)      : {fn} (Converter prédit Stable)")
-
-total_acc = (tn + tp) / len(y_true)
-print(f"\n> Précision Globale : {total_acc:.2%}")
-print("="*40 + "\n")
+plt.tight_layout()
+plt.savefig("tsne_mci_vivid.png", dpi=300)
+print("✅ tsne_mci_vivid.png sauvegardé.")
 
 # ==========================================
-# 5. CALCUL t-SNE & VISUALISATION
+# 4. ANALYSE 2 : CN vs AD (LES EXTRÊMES)
 # ==========================================
-if len(X) < 5:
-    print("⚠ Pas assez de données pour le t-SNE.")
-else:
-    print(f"Lancement t-SNE sur {len(X)} patients...")
-    # Perplexity auto-adaptative
-    perp = min(30, len(X) - 1)
-    tsne = TSNE(n_components=2, perplexity=perp, random_state=42, init='pca', learning_rate='auto')
-    X_embedded = tsne.fit_transform(X)
+print("\n--- ANALYSE CN/AD (Test Set) ---")
+if os.path.exists(cn_ad_test_dir):
+    cn_ad_dataset = ADNI2p5DSingleSubjectDataset(cn_ad_test_dir)
+    cn_ad_loader = DataLoader(cn_ad_dataset, batch_size=1, shuffle=False, num_workers=4)
 
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+    X_cnad, y_pred_cnad, y_true_cnad = extract_embeddings(cn_ad_loader, model, device)
 
-    # Graphe 1 : Prédictions
-    scatter1 = axes[0].scatter(X_embedded[:, 0], X_embedded[:, 1], c=y_pred, cmap='coolwarm', alpha=0.8, edgecolors='k')
-    axes[0].set_title(f"PRÉDICTIONS du Modèle\nStable={count_pred_0}, Converter={count_pred_1}")
-    legend1 = axes[0].legend(*scatter1.legend_elements(), title="Pred (0=Stable, 1=Conv)")
-    axes[0].add_artist(legend1)
-    axes[0].grid(True, alpha=0.3)
+    # t-SNE CN/AD
+    tsne_cnad = TSNE(n_components=2, perplexity=min(30, len(X_cnad)-1), random_state=42)
+    X_emb_cnad = tsne_cnad.fit_transform(X_cnad)
 
-    # Graphe 2 : Vrais Labels
-    scatter2 = axes[1].scatter(X_embedded[:, 0], X_embedded[:, 1], c=y_true, cmap='viridis', alpha=0.8, edgecolors='k')
-    axes[1].set_title(f"VRAIS LABELS (Vérité Terrain)\nStable={count_true_0}, Converter={count_true_1}")
-    legend2 = axes[1].legend(*scatter2.legend_elements(), title="True (0=Stable, 1=Conv)")
-    axes[1].add_artist(legend2)
-    axes[1].grid(True, alpha=0.3)
+    # PLOT CN/AD
+    fig2, ax2 = plt.subplots(1, 1, figsize=(10, 8))
+    
+    # Couleurs différentes pour bien distinguer : Vert (CN) vs Violet (AD)
+    colors_cnad = ['#2ca02c', '#9467bd'] 
+    labels_cnad = ['Cognitively Normal (CN)', 'Alzheimer (AD)']
 
-    out_filename = "tsne_mci_finetuned.png"
+    for i in [0, 1]: # 0=CN, 1=AD
+        idx = y_true_cnad == i
+        ax2.scatter(X_emb_cnad[idx, 0], X_emb_cnad[idx, 1], c=colors_cnad[i], label=labels_cnad[i], s=100, alpha=0.8, edgecolors='k')
+    
+    ax2.set_title("t-SNE : CN vs AD (Vrais Labels)\nPermet de voir la séparabilité 'facile'")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig(out_filename, dpi=300)
-    print(f"✅ Image sauvegardée sous : '{out_filename}'")
-    plt.show()
+    plt.savefig("tsne_cn_ad.png", dpi=300)
+    print("✅ tsne_cn_ad.png sauvegardé.")
+else:
+    print("⚠ Dossier CN/AD introuvable, pas de 2ème graphe.")
+
+plt.show()

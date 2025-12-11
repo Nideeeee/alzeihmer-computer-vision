@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torchvision.models as models
-import umap  # <--- Bibliothèque UMAP
+import umap 
 from sklearn.metrics import confusion_matrix
 from collections import Counter
 from tqdm import tqdm
@@ -24,14 +24,11 @@ class ADNI2p5DSingleSubjectDataset(Dataset):
     def __getitem__(self, idx):
         return torch.load(self.files[idx])
 
-# Modèle pour l'inférence (doit correspondre à ton architecture entraînée)
 class ResNetForInference(nn.Module):
     def __init__(self, num_classes=2):
         super(ResNetForInference, self).__init__()
         base_model = models.resnet18(weights=None) 
         self.features = nn.Sequential(*list(base_model.children())[:-1])
-        # Note: Si tu as utilisé un Dropout dans l'entraînement avancé, 
-        # il est ignoré ici car on est en mode .eval()
         self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x):
@@ -42,22 +39,48 @@ class ResNetForInference(nn.Module):
         logits = self.fc(x) 
         return logits, features
 
+def extract_embeddings(loader, model, device):
+    embeddings, preds, labels = [], [], []
+    with torch.no_grad():
+        for slices, label in tqdm(loader, desc="Extraction"):
+            slices = slices[0].to(device)
+            label = label.item()
+            
+            logits, features = model(slices)
+            
+            # Agrégation Patient (Moyenne)
+            patient_feat = features.mean(dim=0).cpu().numpy()
+            slice_preds = logits.argmax(dim=1).cpu().numpy()
+            patient_pred = Counter(slice_preds).most_common(1)[0][0]
+            
+            embeddings.append(patient_feat)
+            preds.append(patient_pred)
+            labels.append(label)
+    return np.array(embeddings), np.array(preds), np.array(labels)
+
 # ==========================================
 # 2. CONFIGURATION
 # ==========================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
+plt.style.use('seaborn-v0_8-whitegrid') # Style propre
 
-# --- A ADAPTER ---
-test_dir = "slices_cache_filtered/mci/test" 
-model_path = "weights/best_model_loss.pth" # Ton meilleur modèle
+# Chemins
+mci_test_dir = "slices_cache_filtered/mci/test" 
+# On pointe vers le TRAIN pour avoir tous les CN/AD (~400 sujets)
+cn_ad_test_dir = "slices_cache_filtered/mci/train" 
+
+# Gestion du chemin du modèle
+model_name = "best_model_loss.pth"
+if os.path.exists(model_name):
+    model_path = model_name
+elif os.path.exists(os.path.join("weights", model_name)):
+    model_path = os.path.join("weights", model_name)
+else:
+    print(f"⚠ '{model_name}' introuvable, fallback sur 'best_model.pth'")
+    model_path = "best_model.pth"
 
 if not os.path.exists(model_path):
-    print(f"⚠ '{model_path}' introuvable, essai avec 'best_model_temp.pth'...")
-    model_path = "weights/best_model_temp.pth"
-# Chargement Données
-print(f"Chargement des données depuis {test_dir}...")
-test_dataset = ADNI2p5DSingleSubjectDataset(test_dir)
-test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+     raise FileNotFoundError(f"❌ Aucun modèle trouvé ! (Cherché: {model_path})")
 
 # Chargement Modèle
 print(f"Chargement du modèle depuis {model_path}...")
@@ -70,79 +93,88 @@ except:
 model.eval()
 
 # ==========================================
-# 3. EXTRACTION DES EMBEDDINGS
+# 3. ANALYSE 1 : MCI (STABLE vs CONVERTER)
 # ==========================================
-print("Extraction des features...")
+print("\n--- ANALYSE MCI (Test Set) ---")
+mci_dataset = ADNI2p5DSingleSubjectDataset(mci_test_dir)
+mci_loader = DataLoader(mci_dataset, batch_size=1, shuffle=False, num_workers=4)
 
-patient_embeddings = []
-patient_preds = []
-patient_labels = []
+X_mci, y_pred_mci, y_true_mci = extract_embeddings(mci_loader, model, device)
 
-with torch.no_grad():
-    for slices, label in tqdm(test_loader):
-        slices = slices[0].to(device)
-        label = label.item()
-        
-        logits, features = model(slices)
-        
-        # Moyenne des embeddings (Aggregation Patient)
-        patient_feat = features.mean(dim=0).cpu().numpy()
-        
-        # Prédiction (Vote majoritaire)
-        slice_preds = logits.argmax(dim=1).cpu().numpy()
-        patient_pred = Counter(slice_preds).most_common(1)[0][0]
-        
-        patient_embeddings.append(patient_feat)
-        patient_preds.append(patient_pred)
-        patient_labels.append(label)
+# UMAP MCI
+print("Calcul UMAP MCI...")
+reducer_mci = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, metric='cosine', random_state=42)
+X_emb_mci = reducer_mci.fit_transform(X_mci)
 
-X = np.array(patient_embeddings)
-y_pred = np.array(patient_preds)
-y_true = np.array(patient_labels)
-
-# ==========================================
-# 4. CALCUL UMAP
-# ==========================================
-print(f"Lancement de UMAP sur {len(X)} patients...")
-
-# Paramètres UMAP optimisés pour la visualisation
-# n_neighbors : Taille du voisinage (plus petit = plus local, plus grand = plus global)
-# min_dist : Distance min entre les points (plus petit = clusters plus serrés)
-reducer = umap.UMAP(
-    n_neighbors=15, 
-    min_dist=0.1, 
-    n_components=2, 
-    metric='cosine', # Souvent meilleur pour les embeddings profonds que 'euclidean'
-    random_state=42
-)
-X_embedded = reducer.fit_transform(X)
-
-# ==========================================
-# 5. VISUALISATION
-# ==========================================
-# Stats rapides
-tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-acc = (tn + tp) / len(y_true)
-print(f"Accuracy du modèle chargé : {acc:.2%}")
-
+# PLOT MCI
 fig, axes = plt.subplots(1, 2, figsize=(18, 8))
 
-# Graphe 1 : PRÉDICTIONS
-scatter1 = axes[0].scatter(X_embedded[:, 0], X_embedded[:, 1], c=y_pred, cmap='coolwarm', alpha=0.8, edgecolors='k')
-axes[0].set_title(f"UMAP - PRÉDICTIONS du Modèle\n(Bleu=Stable Prédit, Rouge=Conv Prédit)")
-legend1 = axes[0].legend(*scatter1.legend_elements(), title="Pred")
-axes[0].add_artist(legend1)
+# Couleurs Vives (Identiques TSNE)
+colors = ['#1f77b4', '#d62728'] # Bleu, Rouge
+labels_map = ['Stable (0)', 'Converter (1)']
+
+# Graphe 1 : Prédictions
+for i in [0, 1]:
+    idx = y_pred_mci == i
+    axes[0].scatter(X_emb_mci[idx, 0], X_emb_mci[idx, 1], c=colors[i], label=labels_map[i], s=100, alpha=0.8, edgecolors='white')
+axes[0].set_title("PRÉDICTIONS (MCI) - UMAP")
+axes[0].legend()
 axes[0].grid(True, alpha=0.3)
 
-# Graphe 2 : VRAIS LABELS
-scatter2 = axes[1].scatter(X_embedded[:, 0], X_embedded[:, 1], c=y_true, cmap='viridis', alpha=0.8, edgecolors='k')
-axes[1].set_title(f"UMAP - VRAIS LABELS (Vérité Terrain)\n(Violet=Stable Réel, Jaune=Conv Réel)")
-legend2 = axes[1].legend(*scatter2.legend_elements(), title="True")
-axes[1].add_artist(legend2)
+# Graphe 2 : Vrais Labels
+for i in [0, 1]:
+    idx = y_true_mci == i
+    axes[1].scatter(X_emb_mci[idx, 0], X_emb_mci[idx, 1], c=colors[i], label=labels_map[i], s=100, alpha=0.8, edgecolors='white')
+axes[1].set_title("VRAIS LABELS (MCI) - UMAP")
+axes[1].legend()
 axes[1].grid(True, alpha=0.3)
 
-out_filename = "umap_mci_comparison.png"
 plt.tight_layout()
-plt.savefig(out_filename, dpi=300)
-print(f"✅ Image sauvegardée sous : '{out_filename}'")
+plt.savefig("umap_mci_vivid.png", dpi=300)
+print("✅ umap_mci_vivid.png sauvegardé.")
+
+# ==========================================
+# 4. ANALYSE 2 : CN vs AD (LES EXTRÊMES)
+# ==========================================
+print("\n--- ANALYSE CN/AD (Dataset Complet Train) ---")
+if os.path.exists(cn_ad_test_dir):
+    cn_ad_dataset = ADNI2p5DSingleSubjectDataset(cn_ad_test_dir)
+    cn_ad_loader = DataLoader(cn_ad_dataset, batch_size=1, shuffle=False, num_workers=4)
+
+    X_cnad, y_pred_cnad, y_true_cnad = extract_embeddings(cn_ad_loader, model, device)
+
+    # UMAP CN/AD
+    print("Calcul UMAP CN/AD...")
+    reducer_cnad = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, metric='cosine', random_state=42)
+    X_emb_cnad = reducer_cnad.fit_transform(X_cnad)
+
+    # PLOT CN/AD - FORMAT IDENTIQUE
+    fig2, axes2 = plt.subplots(1, 2, figsize=(18, 8))
+    
+    # Couleurs Vives : Vert (CN) vs Violet (AD)
+    colors_cnad = ['#2ca02c', '#9467bd'] 
+    labels_cnad = ['Cognitively Normal (CN)', 'Alzheimer (AD)']
+
+    # Graphe 1 : Prédictions
+    for i in [0, 1]: # 0=CN, 1=AD
+        idx = y_pred_cnad == i
+        axes2[0].scatter(X_emb_cnad[idx, 0], X_emb_cnad[idx, 1], c=colors_cnad[i], label=labels_cnad[i], s=100, alpha=0.8, edgecolors='white')
+    axes2[0].set_title("PRÉDICTIONS (CN/AD) - UMAP")
+    axes2[0].legend()
+    axes2[0].grid(True, alpha=0.3)
+
+    # Graphe 2 : Vrais Labels
+    for i in [0, 1]: # 0=CN, 1=AD
+        idx = y_true_cnad == i
+        axes2[1].scatter(X_emb_cnad[idx, 0], X_emb_cnad[idx, 1], c=colors_cnad[i], label=labels_cnad[i], s=100, alpha=0.8, edgecolors='white')
+    axes2[1].set_title("VRAIS LABELS (CN/AD) - UMAP")
+    axes2[1].legend()
+    axes2[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("umap_cn_ad.png", dpi=300)
+    print("✅ umap_cn_ad.png sauvegardé.")
+else:
+    print("⚠ Dossier CN/AD introuvable, pas de 2ème graphe.")
+
 plt.show()

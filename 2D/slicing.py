@@ -10,12 +10,10 @@ def load_nifti_image(filepath):
 
 def extract_slices(volume, num_slices_per_plane=7):
     x_dim, y_dim, z_dim = volume.shape
-
-    # On ignore 10% des bords pour chaque axe
     def centered_linspace(start, stop, num):
         return np.linspace(start, stop, num, dtype=int)
 
-    margin_x = int(0.2 * x_dim)
+    margin_x = int(0.2 * x_dim) #marge pour avoir des coupes interessantes
     margin_y = int(0.2 * y_dim)
     margin_z = int(0.2 * z_dim)
 
@@ -49,29 +47,7 @@ def visualize_slices(slices, indices, volume_shape):
     
     plt.tight_layout()
     plt.savefig('slices_overview.png', dpi=150, bbox_inches='tight')
-    print("✓ Visualisation sauvegardée : slices_overview.png")
     plt.show()
-
-def print_slice_info(volume, slices, indices):
-    """
-    Affiche les informations sur les coupes extraites
-    """
-    print("\n" + "="*60)
-    print("INFORMATIONS SUR L'IMAGE 3D")
-    print("="*60)
-    print(f"Dimensions du volume : {volume.shape} (X×Y×Z)")
-    print(f"Taille voxel : {volume.dtype}")
-    print(f"Range des valeurs : [{volume.min():.2f}, {volume.max():.2f}]")
-    
-    print("\n" + "="*60)
-    print("COUPES EXTRAITES")
-    print("="*60)
-    
-    for plane_name in ['axial', 'coronal', 'sagittal']:
-        print(f"\n{plane_name.upper()}:")
-        print(f"  Nombre de coupes : {len(slices[plane_name])}")
-        print(f"  Indices : {indices[plane_name]}")
-        print(f"  Taille de chaque coupe : {slices[plane_name][0].shape}")
 
 if __name__ == "__main__":
 
@@ -80,5 +56,4 @@ if __name__ == "__main__":
     volume = load_nifti_image(filepath)
 
     slices_regular, indices_regular = extract_slices(volume, num_slices_per_plane=7)
-    print_slice_info(volume, slices_regular, indices_regular)
     visualize_slices(slices_regular, indices_regular, volume.shape)
